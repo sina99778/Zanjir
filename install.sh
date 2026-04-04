@@ -1,551 +1,438 @@
 #!/usr/bin/env bash
-# Zanjir - Matrix Server Auto-Installer
-# Optimized for Iranian VPS
-set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+set -euo pipefail
 
-print_banner() {
-    echo ""
-    echo -e "${CYAN}=================================================${NC}"
-    echo -e "${CYAN}       Zanjir - Matrix Server Installer          ${NC}"
-    echo -e "${CYAN}=================================================${NC}"
-    echo ""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+WHIPTAIL_TITLE="Zanjir Installer"
+DOCKER_MIRRORS=(
+  "https://docker.arvancloud.ir"
+  "https://registry.docker.ir"
+)
+
+cleanup() {
+  rm -f /tmp/zanjir-whiptail-* 2>/dev/null || true
 }
 
-log_info() { echo -e "${BLUE}[*]${NC} $1"; }
-log_success() { echo -e "${GREEN}[+]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
-log_error() { echo -e "${RED}[-]${NC} $1"; }
-
-normalize_line_endings() {
-    if ! command -v sed &> /dev/null; then
-        return 0
-    fi
-
-    local files=(
-        "scripts/generate-keys.sh"
-        "docker-compose.yml"
-        "Caddyfile"
-        "Caddyfile.ip-mode"
-        "dendrite/dendrite.yaml"
-        "config/element-config.json"
-    )
-
-    local f
-    for f in "${files[@]}"; do
-        if [ -f "$f" ]; then
-            sed -i 's/\r$//' "$f" 2>/dev/null || true
-        fi
-    done
+show_error() {
+  local message="$1"
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "${WHIPTAIL_TITLE}" --msgbox "${message}" 12 72
+  else
+    printf 'ERROR: %s\n' "${message}" >&2
+  fi
 }
 
-load_env_if_exists() {
-    if [ -f ".env" ]; then
-        set -a
-        . ./.env
-        set +a
-    fi
+handle_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  trap - ERR
+  cleanup
+  show_error "Installation failed at line ${line_no} with exit code ${exit_code}."
+  exit "${exit_code}"
 }
 
-is_dockerhub_restriction_error() {
-    local text=$1
-    echo "$text" | grep -Eqi '403 Forbidden|export control regulations|Since Docker is a US company'
+trap 'handle_error $? $LINENO' ERR
+trap cleanup EXIT
+
+require_root() {
+  if [ "${EUID}" -ne 0 ]; then
+    show_error "Please run this installer as root or with sudo."
+    exit 1
+  fi
 }
 
-json_array_from_csv() {
-    local csv=$1
-    python3 - "$csv" <<'PY'
-import json, sys
-csv = sys.argv[1]
-parts = [p.strip() for p in csv.replace(";", ",").split(",")]
-parts = [p for p in parts if p]
-print(json.dumps(parts))
-PY
+bootstrap_whiptail() {
+  if command -v whiptail >/dev/null 2>&1; then
+    return 0
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  configure_apt_for_iran
+  apt-get update >/dev/null
+  apt-get install -y whiptail >/dev/null
 }
 
-configure_docker_registry_mirrors() {
-    local mirrors_csv=$1
-    if [ -z "$mirrors_csv" ]; then
-        return 1
-    fi
-
-    local mirrors_json
-    if command -v python3 &> /dev/null; then
-        mirrors_json=$(json_array_from_csv "$mirrors_csv")
-    else
-        local cleaned
-        cleaned=$(echo "$mirrors_csv" | tr ';' ',' | tr -s ' ')
-        local IFS=,
-        read -ra _parts <<< "$cleaned"
-        local json="["
-        local first=1
-        for p in "${_parts[@]}"; do
-            p=$(echo "$p" | xargs)
-            [ -z "$p" ] && continue
-            if [ "$first" -eq 0 ]; then
-                json+=","
-            fi
-            first=0
-            json+="\"$p\""
-        done
-        json+="]"
-        mirrors_json="$json"
-    fi
-
-    log_info "Configuring Docker registry mirrors..."
-    mkdir -p /etc/docker
-
-    local daemon_file="/etc/docker/daemon.json"
-    if [ -f "$daemon_file" ]; then
-        cp -a "$daemon_file" "${daemon_file}.bak.$(date +%s)" 2>/dev/null || true
-    fi
-
-    if command -v python3 &> /dev/null; then
-        python3 - "$daemon_file" "$mirrors_json" <<'PY'
-import json, sys, pathlib, re
-
-daemon_file = pathlib.Path(sys.argv[1])
-mirrors = json.loads(sys.argv[2])
-
-data = {}
-if daemon_file.exists():
-    try:
-        raw = daemon_file.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        data = {}
-
-def insecure_from_url(url: str) -> str:
-    url = re.sub(r"^https?://", "", url)
-    url = url.split("/", 1)[0]
-    return url
-
-data["registry-mirrors"] = mirrors
-data["insecure-registries"] = sorted({insecure_from_url(u) for u in mirrors})
-
-daemon_file.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-PY
-    else
-        cat > "$daemon_file" <<EOF
-{
-  "registry-mirrors": $mirrors_json,
-  "insecure-registries": $(echo "$mirrors_json" | sed -E 's#https?://##g;s#/[^"]*##g')
-}
-EOF
-    fi
-
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart docker
-    log_success "Docker mirrors configured."
+msgbox() {
+  whiptail --title "${WHIPTAIL_TITLE}" --msgbox "$1" 14 78
 }
 
-ensure_docker_registry_access() {
-    local mirrors_csv="${DOCKER_REGISTRY_MIRRORS:-${DOCKER_REGISTRY_MIRROR:-}}"
-    if [ -n "$mirrors_csv" ]; then
-        configure_docker_registry_mirrors "$mirrors_csv" || true
-        return 0
-    fi
-
-    load_env_if_exists
-    local probe_image="${DOCKER_PROBE_IMAGE:-hello-world:latest}"
-
-    set +e
-    local pull_output
-    pull_output=$(docker pull "$probe_image" 2>&1)
-    local pull_exit=$?
-    set -e
-
-    if [ "$pull_exit" -eq 0 ]; then
-        return 0
-    fi
-
-    if ! is_dockerhub_restriction_error "$pull_output"; then
-        log_warning "Docker pull failed (not a sanctions-style 403). Continuing..."
-        return 0
-    fi
-
-    log_warning "Docker Hub appears restricted from this server IP. Applying Iran-friendly mirrors..."
-
-    local default_mirrors="https://docker.arvancloud.ir,https://registry.docker.ir,https://docker.iranserver.com,https://mirror-docker.runflare.com"
-    configure_docker_registry_mirrors "$default_mirrors"
+infobox() {
+  whiptail --title "${WHIPTAIL_TITLE}" --infobox "$1" 10 78
 }
 
-docker_pull_with_mirror_fallback() {
-    local image=$1
-
-    set +e
-    local out
-    out=$(docker pull "$image" 2>&1)
-    local code=$?
-    set -e
-
-    if [ "$code" -eq 0 ]; then
-        return 0
-    fi
-
-    if is_dockerhub_restriction_error "$out"; then
-        ensure_docker_registry_access
-        docker pull "$image"
-        return $?
-    fi
-
-    echo "$out" >&2
-    return "$code"
+yesno() {
+  whiptail --title "${WHIPTAIL_TITLE}" --yesno "$1" 12 78
 }
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "Please run with sudo"
-        exit 1
-    fi
+inputbox() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local output_file
+  output_file="$(mktemp /tmp/zanjir-whiptail-input.XXXXXX)"
+
+  if ! whiptail --title "${WHIPTAIL_TITLE}" --inputbox "${prompt}" 12 78 "${default_value}" 2>"${output_file}"; then
+    rm -f "${output_file}"
+    return 1
+  fi
+
+  cat "${output_file}"
+  rm -f "${output_file}"
 }
 
 is_ip_address() {
-    local ip=$1
-    [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
+  local value="$1"
+  [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
-get_user_input() {
-    echo ""
-    log_info "Configuration questions..."
-    echo ""
-    
-    # Get server address
-    while true; do
-        read -p "Server address (domain or IP): " SERVER_ADDRESS
-        if [ -n "$SERVER_ADDRESS" ]; then
-            break
-        fi
-        log_error "Address cannot be empty!"
+read_env_value() {
+  local key="$1"
+  local default_value="${2:-}"
+
+  if [ -f "${ENV_FILE}" ]; then
+    local value
+    value="$(grep -E "^${key}=" "${ENV_FILE}" | tail -n 1 | cut -d= -f2- || true)"
+    if [ -n "${value}" ]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+  fi
+
+  printf '%s' "${default_value}"
+}
+
+generate_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
+  fi
+}
+
+configure_apt_for_iran() {
+  [ -f /etc/os-release ] || return 0
+  . /etc/os-release
+
+  local sources_file="/etc/apt/sources.list"
+  if [ ! -f "${sources_file}" ]; then
+    return 0
+  fi
+
+  cp -n "${sources_file}" "${sources_file}.zanjir.bak"
+
+  case "${ID:-}" in
+    ubuntu)
+      sed -i \
+        -e 's#https\?://[A-Za-z0-9./-]*archive\.ubuntu\.com/ubuntu/#https://mirror.arvancloud.ir/ubuntu/#g' \
+        -e 's#https\?://[A-Za-z0-9./-]*security\.ubuntu\.com/ubuntu/#https://mirror.arvancloud.ir/ubuntu/#g' \
+        -e 's#https\?://[A-Za-z0-9./-]*ports\.ubuntu\.com/ubuntu-ports/#https://mirror.arvancloud.ir/ubuntu/#g' \
+        "${sources_file}"
+      ;;
+    debian)
+      sed -i \
+        -e 's#https\?://[A-Za-z0-9./-]*deb\.debian\.org/debian#https://mirror.arvancloud.ir/debian#g' \
+        -e 's#https\?://[A-Za-z0-9./-]*security\.debian\.org/debian-security#https://mirror.arvancloud.ir/debian-security#g' \
+        "${sources_file}"
+      ;;
+  esac
+
+  cat > /etc/apt/apt.conf.d/99zanjir <<'EOF'
+Acquire::Retries "5";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+EOF
+}
+
+configure_docker_mirrors() {
+  mkdir -p /etc/docker
+
+  local daemon_file="/etc/docker/daemon.json"
+  if [ -f "${daemon_file}" ] && [ ! -f "${daemon_file}.zanjir.bak" ]; then
+    cp "${daemon_file}" "${daemon_file}.zanjir.bak"
+  fi
+
+  cat > "${daemon_file}" <<EOF
+{
+  "registry-mirrors": [
+    "${DOCKER_MIRRORS[0]}",
+    "${DOCKER_MIRRORS[1]}"
+  ],
+  "insecure-registries": [
+    "docker.arvancloud.ir",
+    "registry.docker.ir"
+  ]
+}
+EOF
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart docker >/dev/null 2>&1 || true
+  fi
+}
+
+docker_ready() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+compose_ready() {
+  if docker compose version >/dev/null 2>&1; then
+    return 0
+  fi
+
+  command -v docker-compose >/dev/null 2>&1
+}
+
+run_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
+install_docker_stack() {
+  infobox "Checking Docker prerequisites and applying Iran-friendly mirrors..."
+  configure_apt_for_iran
+  configure_docker_mirrors
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update >/dev/null
+
+  if ! command -v docker >/dev/null 2>&1; then
+    apt-get install -y ca-certificates curl docker.io >/dev/null
+  fi
+
+  if ! docker compose version >/dev/null 2>&1; then
+    if ! apt-get install -y docker-compose-plugin >/dev/null 2>&1; then
+      apt-get install -y docker-compose >/dev/null
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1
+  else
+    service docker start >/dev/null 2>&1 || true
+  fi
+
+  configure_docker_mirrors
+
+  if ! docker_ready; then
+    show_error "Docker could not be started on this server. Please verify the Docker service and try again."
+    exit 1
+  fi
+
+  if ! compose_ready; then
+    show_error "Docker Compose could not be installed automatically."
+    exit 1
+  fi
+}
+
+ensure_docker_stack() {
+  infobox "Checking Docker and Docker Compose..."
+
+  if docker_ready && compose_ready; then
+    return 0
+  fi
+
+  if yesno "Docker or Docker Compose is missing. The installer can configure Iranian mirrors and try to install them now. Continue?"; then
+    install_docker_stack
+  else
+    show_error "Installation cancelled because Docker is required."
+    exit 1
+  fi
+}
+
+load_offline_images() {
+  local images_dir="${SCRIPT_DIR}/images"
+  if [ ! -d "${images_dir}" ]; then
+    msgbox "No offline image bundle was detected in ${images_dir}. The installer will continue with local or online Docker sources."
+    return 0
+  fi
+
+  shopt -s nullglob
+  local image_files=("${images_dir}"/*.tar)
+  shopt -u nullglob
+
+  if [ "${#image_files[@]}" -eq 0 ]; then
+    msgbox "The images directory exists, but no .tar files were found. The installer will continue without offline image loading."
+    return 0
+  fi
+
+  local total="${#image_files[@]}"
+  {
+    local index=0
+    local tar_file
+    for tar_file in "${image_files[@]}"; do
+      local percent=$(( index * 100 / total ))
+      echo "${percent}"
+      echo "XXX"
+      echo "Loading offline image $(basename "${tar_file}")..."
+      echo "XXX"
+      docker load -i "${tar_file}" >/dev/null
+      index=$(( index + 1 ))
     done
-    
-    # Detect IP mode
-    if is_ip_address "$SERVER_ADDRESS"; then
-        IP_MODE=true
-        PROTOCOL="https"
-        log_warning "IP mode detected. Self-signed SSL will be used."
-        log_warning "Browser will show security warning - click Advanced > Proceed."
-    else
-        IP_MODE=false
-        PROTOCOL="https"
-        log_success "Domain mode. SSL will be obtained from Let's Encrypt."
-    fi
-    
-    # Get admin email (only for domain mode)
-    if [ "$IP_MODE" = false ]; then
-        read -p "Admin email (for SSL): " ADMIN_EMAIL
-        if [ -z "$ADMIN_EMAIL" ]; then
-            ADMIN_EMAIL="admin@${SERVER_ADDRESS}"
-        fi
-    else
-        ADMIN_EMAIL=""
-    fi
-    
-    # Get custom port (optional)
-    while true; do
-        read -p "HTTPS port (default: 443): " HTTPS_PORT
-        if [ -z "$HTTPS_PORT" ]; then
-            HTTPS_PORT=443
-            break
-        elif [[ "$HTTPS_PORT" =~ ^[0-9]+$ ]] && [ "$HTTPS_PORT" -ge 1 ] && [ "$HTTPS_PORT" -le 65535 ]; then
-            break
-        else
-            log_error "Invalid port! Must be between 1-65535"
-        fi
-    done
-    
-    # Calculate HTTP port (HTTPS_PORT - 363, but ensure it's valid)
-    HTTP_PORT=$((HTTPS_PORT - 363))
-    if [ "$HTTP_PORT" -lt 1 ]; then
-        HTTP_PORT=80
-    fi
-    
-    echo ""
-    log_info "Settings:"
-    echo "   Address: ${SERVER_ADDRESS}"
-    echo "   Protocol: ${PROTOCOL}"
-    echo "   HTTPS Port: ${HTTPS_PORT}"
-    echo "   HTTP Port: ${HTTP_PORT}"
-    if [ "$IP_MODE" = false ]; then
-        echo "   Email: ${ADMIN_EMAIL}"
-    fi
-    echo ""
-    
-    read -p "Is this correct? (Y/n): " confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        log_error "Cancelled."
-        exit 1
-    fi
+    echo "100"
+    echo "XXX"
+    echo "Offline Docker images loaded successfully."
+    echo "XXX"
+  } | whiptail --title "${WHIPTAIL_TITLE}" --gauge "Loading offline Docker images..." 10 78 0
 }
 
-install_docker() {
-    if command -v docker &> /dev/null; then
-        log_success "Docker is installed."
-        return
+prompt_required_input() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local result=""
+
+  while :; do
+    if ! result="$(inputbox "${prompt}" "${default_value}")"; then
+      show_error "Installation cancelled."
+      exit 1
     fi
-    log_info "Installing Docker..."
-    
-    # Try official script first, fallback to apt
-    if curl -fsSL https://get.docker.com | sh 2>/dev/null; then
-        log_success "Docker installed from official script."
-    else
-        log_warning "Official Docker install failed, trying apt..."
-        apt-get update -qq
-        apt-get install -y -qq docker.io
+
+    if [ -n "${result}" ]; then
+      printf '%s' "${result}"
+      return 0
     fi
-    
-    systemctl enable docker
-    systemctl start docker
-    log_success "Docker installed."
+
+    msgbox "This field cannot be empty."
+  done
 }
 
-install_docker_compose() {
-    # Check if docker compose works
-    if docker compose version &> /dev/null; then
-        log_success "Docker Compose is installed."
-        return
+prompt_configuration() {
+  local saved_address
+  saved_address="$(read_env_value "SERVER_ADDRESS" "$(read_env_value "DOMAIN" "")")"
+  SERVER_ADDRESS="$(prompt_required_input "Enter the public domain name or IP address for this Zanjir server." "${saved_address}")"
+
+  local saved_port
+  saved_port="$(read_env_value "HTTPS_PORT" "443")"
+  HTTPS_PORT="$(prompt_required_input "Enter the HTTPS port for Zanjir." "${saved_port}")"
+  if ! [[ "${HTTPS_PORT}" =~ ^[0-9]+$ ]] || [ "${HTTPS_PORT}" -lt 1 ] || [ "${HTTPS_PORT}" -gt 65535 ]; then
+    show_error "HTTPS port must be a number between 1 and 65535."
+    exit 1
+  fi
+
+  local email_default
+  if is_ip_address "${SERVER_ADDRESS}"; then
+    email_default="$(read_env_value "LETSENCRYPT_EMAIL" "")"
+  else
+    email_default="$(read_env_value "LETSENCRYPT_EMAIL" "admin@${SERVER_ADDRESS}")"
+  fi
+
+  if ! ADMIN_EMAIL="$(inputbox "Enter the admin email address used for TLS notifications. Leave blank if you are installing by IP only." "${email_default}")"; then
+    show_error "Installation cancelled."
+    exit 1
+  fi
+
+  DOMAIN="${SERVER_ADDRESS}"
+  HTTP_PORT="80"
+  PROTOCOL="https"
+  if is_ip_address "${SERVER_ADDRESS}"; then
+    IP_MODE="true"
+    [ -n "${ADMIN_EMAIL}" ] || ADMIN_EMAIL=""
+  else
+    IP_MODE="false"
+    if [ -z "${ADMIN_EMAIL}" ]; then
+      ADMIN_EMAIL="admin@${SERVER_ADDRESS}"
     fi
-    
-    log_info "Installing Docker Compose..."
-    
-    # Try apt plugin first
-    if apt-get update -qq && apt-get install -y -qq docker-compose-plugin 2>/dev/null; then
-        log_success "Docker Compose plugin installed."
-        return
-    fi
-    
-    # Fallback: download binary directly
-    log_warning "Plugin not available, downloading binary..."
-    COMPOSE_VERSION="v2.24.0"
-    curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    
-    # Create plugin symlink
-    mkdir -p /usr/lib/docker/cli-plugins/
-    ln -sf /usr/local/bin/docker-compose /usr/lib/docker/cli-plugins/docker-compose
-    
-    if docker compose version &> /dev/null; then
-        log_success "Docker Compose installed."
-    else
-        log_error "Docker Compose installation failed!"
-        exit 1
-    fi
+  fi
+
+  if ! yesno "Please confirm the configuration:\n\nAddress: ${SERVER_ADDRESS}\nHTTPS Port: ${HTTPS_PORT}\nAdmin Email: ${ADMIN_EMAIL:-none}\nOffline Images: $( [ -d "${SCRIPT_DIR}/images" ] && printf 'yes' || printf 'no' )"; then
+    show_error "Installation cancelled."
+    exit 1
+  fi
 }
 
-generate_secrets() {
-    log_info "Generating security keys..."
-    REGISTRATION_SECRET=$(openssl rand -base64 32 | tr -d '/+=')
-    TURN_SECRET=$(openssl rand -base64 32 | tr -d '/+=')
-    log_success "Keys generated."
-}
+write_env_file() {
+  local registration_secret
+  local turn_secret
+  local conduit_image
+  local coturn_image
+  local element_image
+  local element_copy_image
+  local caddy_image
+  registration_secret="$(read_env_value "REGISTRATION_SHARED_SECRET" "")"
+  turn_secret="$(read_env_value "TURN_SECRET" "")"
+  conduit_image="$(read_env_value "CONDUIT_IMAGE" "docker.io/matrixconduit/matrix-conduit:latest")"
+  coturn_image="$(read_env_value "COTURN_IMAGE" "coturn/coturn:latest")"
+  element_image="$(read_env_value "ELEMENT_IMAGE" "vectorim/element-web:v1.11.50")"
+  element_copy_image="$(read_env_value "ELEMENT_COPY_IMAGE" "vectorim/element-web:v1.11.50")"
+  caddy_image="$(read_env_value "CADDY_IMAGE" "caddy:2-alpine")"
 
-create_env_file() {
-    log_info "Creating .env file..."
-    cat > .env <<EOF
-DOMAIN=${SERVER_ADDRESS}
+  if [ -z "${registration_secret}" ]; then
+    registration_secret="$(generate_secret)"
+  fi
+  if [ -z "${turn_secret}" ]; then
+    turn_secret="$(generate_secret)"
+  fi
+
+  cat > "${ENV_FILE}" <<EOF
+DOMAIN=${DOMAIN}
 SERVER_ADDRESS=${SERVER_ADDRESS}
 PROTOCOL=${PROTOCOL}
 IP_MODE=${IP_MODE}
 HTTPS_PORT=${HTTPS_PORT}
 HTTP_PORT=${HTTP_PORT}
-REGISTRATION_SHARED_SECRET=${REGISTRATION_SECRET}
-TURN_SECRET=${TURN_SECRET}
+REGISTRATION_SHARED_SECRET=${registration_secret}
+TURN_SECRET=${turn_secret}
 LETSENCRYPT_EMAIL=${ADMIN_EMAIL}
-CONDUIT_IMAGE=docker.io/matrixconduit/matrix-conduit:latest
-COTURN_IMAGE=coturn/coturn:latest
-ELEMENT_IMAGE=vectorim/element-web:v1.11.50
-ELEMENT_COPY_IMAGE=vectorim/element-web:v1.11.50
-CADDY_IMAGE=caddy:2-alpine
+CONDUIT_IMAGE=${conduit_image}
+COTURN_IMAGE=${coturn_image}
+ELEMENT_IMAGE=${element_image}
+ELEMENT_COPY_IMAGE=${element_copy_image}
+CADDY_IMAGE=${caddy_image}
 EOF
-    chmod 600 .env
-    log_success ".env file created."
+
+  chmod 600 "${ENV_FILE}"
 }
 
-setup_caddyfile() {
-    log_info "Setting up Caddy..."
-    if [ "$IP_MODE" = true ]; then
-        cp Caddyfile.ip-mode Caddyfile.active
-    else
-        cp Caddyfile Caddyfile.active
-    fi
-    log_success "Caddy configured."
+configure_caddy() {
+  if [ "${IP_MODE}" = "true" ]; then
+    cp "${SCRIPT_DIR}/Caddyfile.ip-mode" "${SCRIPT_DIR}/Caddyfile.active"
+  else
+    cp "${SCRIPT_DIR}/Caddyfile" "${SCRIPT_DIR}/Caddyfile.active"
+  fi
 }
 
-update_element_config() {
-    log_info "Configuring Element..."
-    
-    # Reset config from git to ensure placeholders exist
-    git checkout -- config/element-config.json 2>/dev/null || true
-    
-    # Replace domain placeholder
-    sed -i "s|\${DOMAIN}|${SERVER_ADDRESS}|g" config/element-config.json
-    
-    # Always use https (self-signed for IP, Let's Encrypt for domain)
-    sed -i "s|http://${SERVER_ADDRESS}|https://${SERVER_ADDRESS}|g" config/element-config.json
-    
-    log_success "Element configured."
-}
-
-update_dendrite_config() {
-    log_info "Configuring Dendrite..."
-    
-    # Reset config from git to ensure placeholders exist
-    git checkout -- dendrite/dendrite.yaml 2>/dev/null || true
-    
-    # Now replace placeholders
-    sed -i "s/\${DOMAIN}/${SERVER_ADDRESS}/g" dendrite/dendrite.yaml
-    sed -i "s/\${POSTGRES_USER}/dendrite/g" dendrite/dendrite.yaml
-    sed -i "s/\${POSTGRES_PASSWORD}/${POSTGRES_PASSWORD}/g" dendrite/dendrite.yaml
-    sed -i "s/\${POSTGRES_DB}/dendrite/g" dendrite/dendrite.yaml
-    sed -i "s/\${REGISTRATION_SHARED_SECRET}/${REGISTRATION_SECRET}/g" dendrite/dendrite.yaml
-    
-    # IP mode uses port 443 with self-signed SSL
-    if [ "$IP_MODE" = true ]; then
-        sed -i "s|:443|:443|g" dendrite/dendrite.yaml
-    fi
-    log_success "Dendrite configured."
-}
-
-generate_matrix_key() {
-    log_info "Generating Matrix signing key..."
-    if [ ! -f "dendrite/matrix_key.pem" ]; then
-        load_env_if_exists
-        ensure_docker_registry_access
-        local dendrite_image="${DENDRITE_IMAGE:-matrixdotorg/dendrite-monolith:latest}"
-
-        log_info "Pulling Dendrite image (this may take a while)..."
-        docker_pull_with_mirror_fallback "$dendrite_image"
-        
-        log_info "Running key generation..."
-        docker run --rm \
-            --entrypoint /usr/bin/generate-keys \
-            -v "$(pwd)/dendrite:/etc/dendrite" \
-            "$dendrite_image" \
-            --private-key /etc/dendrite/matrix_key.pem
-        
-        if [ -f "dendrite/matrix_key.pem" ]; then
-            chmod 600 dendrite/matrix_key.pem
-            log_success "Matrix key generated."
-        else
-            log_error "Failed to generate Matrix key!"
-            exit 1
-        fi
-    else
-        log_warning "Matrix key already exists."
-    fi
+configure_element() {
+  sed -i -E \
+    -e "s#\"base_url\": \"[^\"]*\"#\"base_url\": \"https://${SERVER_ADDRESS}\"#g" \
+    -e "s#\"server_name\": \"[^\"]*\"#\"server_name\": \"${SERVER_ADDRESS}\"#g" \
+    -e "s#\"permalink_prefix\": \"[^\"]*\"#\"permalink_prefix\": \"https://${SERVER_ADDRESS}\"#g" \
+    "${SCRIPT_DIR}/config/element-config.json"
 }
 
 start_services() {
-    ensure_docker_registry_access
-    log_info "Pulling Docker images (this may take a while)..."
-    set +e
-    local pull_out
-    pull_out=$(docker compose pull 2>&1)
-    local pull_code=$?
-    set -e
+  infobox "Preparing Zanjir service configuration..."
+  write_env_file
+  configure_caddy
+  configure_element
 
-    if [ "$pull_code" -ne 0 ]; then
-        if is_dockerhub_restriction_error "$pull_out"; then
-            ensure_docker_registry_access
-            docker compose pull
-        else
-            echo "$pull_out" >&2
-            exit "$pull_code"
-        fi
-    fi
-    
-    log_info "Copying Element files..."
-    docker compose run --rm element-copy
-    
-    log_info "Starting services..."
-    docker compose up -d
-    
-    log_info "Waiting for services to start..."
-    sleep 10
-    
-    log_success "Services started!"
+  infobox "Building local images and starting services..."
+  run_compose build admin >/dev/null
+  run_compose run --rm element-copy >/dev/null
+  run_compose up -d >/dev/null
 }
 
-check_services() {
-    log_info "Checking service status..."
-    docker compose ps
+show_success() {
+  local base_url="${PROTOCOL}://${SERVER_ADDRESS}"
+  if [ "${HTTPS_PORT}" != "443" ]; then
+    base_url="${base_url}:${HTTPS_PORT}"
+  fi
+
+  local admin_url="${base_url}/admin/"
+  msgbox "Zanjir installation completed successfully.\n\nMain URL: ${base_url}\nAdmin Panel: ${admin_url}\nRegistration Secret: $(read_env_value "REGISTRATION_SHARED_SECRET")\n\nIf you are using an IP address, your browser will likely warn about a self-signed certificate the first time you connect."
 }
 
-print_success() {
-    echo ""
-    echo -e "${GREEN}=================================================${NC}"
-    echo -e "${GREEN}          Installation Complete!                 ${NC}"
-    echo -e "${GREEN}=================================================${NC}"
-    echo ""
-    
-    # Construct full URL with port if needed
-    local full_url="${PROTOCOL}://${SERVER_ADDRESS}"
-    if [ "$IP_MODE" = "true" ]; then
-        # In IP mode, always show the port
-        full_url="${full_url}:${HTTPS_PORT}"
-    elif [ "${HTTPS_PORT}" != "443" ]; then
-        # In domain mode, only show port if not standard 443
-        full_url="${full_url}:${HTTPS_PORT}"
-    fi
-    
-    echo "URL: ${full_url}"
-    
-    if [ "$IP_MODE" = true ]; then
-        echo ""
-        echo -e "${YELLOW}Warning: Using self-signed SSL certificate.${NC}"
-        echo -e "${YELLOW}Browser will show security warning - click Advanced > Proceed.${NC}"
-    fi
-    
-    echo ""
-    echo "To create a user, register via Element Web interface at:"
-    echo "  ${full_url}"
-    echo ""
-    echo "Or use the Conduit admin API."
-    echo ""
-    echo "Registration secret (for API): ${REGISTRATION_SECRET}"
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${CYAN}💡 Tip: Run 'zanjir' anytime to manage your server${NC}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
+main() {
+  require_root
+  bootstrap_whiptail
+
+  msgbox "Welcome to the Zanjir air-gapped installer.\n\nThis wizard will check Docker, optionally configure Iranian mirrors, load offline Docker images if available, collect your deployment settings, and start the stack."
+  ensure_docker_stack
+  load_offline_images
+  prompt_configuration
+  start_services
+  show_success
 }
 
-# Install CLI tool
-install_cli_tool() {
-    log_info "Installing Zanjir CLI tool..."
-    
-    # Install figlet if not present (optional, graceful fallback)
-    if ! command -v figlet &> /dev/null; then
-        log_info "Installing figlet for banner..."
-        apt-get install -y figlet 2>/dev/null || log_warning "figlet not installed (optional)"
-    fi
-    
-    # Copy CLI script to /usr/local/bin
-    cp zanjir-cli.sh /usr/local/bin/zanjir
-    chmod +x /usr/local/bin/zanjir
-    
-    log_success "CLI tool installed. Run 'zanjir' to manage your server."
-}
-
-# Main
-print_banner
-check_root
-normalize_line_endings
-get_user_input
-install_docker
-install_docker_compose
-ensure_docker_registry_access
-generate_secrets
-create_env_file
-setup_caddyfile
-update_element_config
-start_services
-check_services
-install_cli_tool
-print_success
+main "$@"
