@@ -28,7 +28,7 @@
         reverse_proxy conduit:6167
     }
 
-    handle /admin/* {
+    handle_path /admin* {
         reverse_proxy admin:5000
     }
 
