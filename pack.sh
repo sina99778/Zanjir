@@ -49,7 +49,43 @@ sanitize_filename() {
 }
 
 collect_compose_images() {
-  docker compose -f "${COMPOSE_FILE}" config --images | sed '/^[[:space:]]*$/d' | sort -u
+  awk '
+    /^[[:space:]]*image:[[:space:]]*/ {
+      value=$0
+      sub(/^[[:space:]]*image:[[:space:]]*/, "", value)
+      print value
+    }
+  ' "${COMPOSE_FILE}" |
+    sed 's/[[:space:]]*#.*$//' |
+    sed 's/^["'\'']//; s/["'\'']$//' |
+    while IFS= read -r image_ref; do
+      [ -z "${image_ref}" ] && continue
+
+      if [[ "${image_ref}" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]+)\}$ ]]; then
+        var_name="${BASH_REMATCH[1]}"
+        default_value="${BASH_REMATCH[2]}"
+        if [ -n "${!var_name:-}" ]; then
+          printf '%s\n' "${!var_name}"
+        else
+          printf '%s\n' "${default_value}"
+        fi
+      elif [[ "${image_ref}" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)-([^}]+)\}$ ]]; then
+        var_name="${BASH_REMATCH[1]}"
+        default_value="${BASH_REMATCH[2]}"
+        if [ -n "${!var_name:-}" ]; then
+          printf '%s\n' "${!var_name}"
+        else
+          printf '%s\n' "${default_value}"
+        fi
+      elif [[ "${image_ref}" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$ ]]; then
+        var_name="${BASH_REMATCH[1]}"
+        [ -n "${!var_name:-}" ] && printf '%s\n' "${!var_name}"
+      else
+        printf '%s\n' "${image_ref}"
+      fi
+    done |
+    sed '/^[[:space:]]*$/d' |
+    sort -u
 }
 
 collect_build_contexts() {

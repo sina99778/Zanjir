@@ -179,14 +179,17 @@ compose_ready() {
     return 0
   fi
 
-  command -v docker-compose >/dev/null 2>&1
+  docker-compose version >/dev/null 2>&1
 }
 
 run_compose() {
   if docker compose version >/dev/null 2>&1; then
     docker compose "$@"
-  else
+  elif docker-compose version >/dev/null 2>&1; then
     docker-compose "$@"
+  else
+    show_error "Docker Compose is not available on this server."
+    exit 1
   fi
 }
 
@@ -204,7 +207,9 @@ install_docker_stack() {
 
   if ! docker compose version >/dev/null 2>&1; then
     if ! apt-get install -y docker-compose-plugin >/dev/null 2>&1; then
-      apt-get install -y docker-compose >/dev/null
+      if ! apt-get install -y docker-compose-v2 >/dev/null 2>&1; then
+        apt-get install -y docker-compose >/dev/null
+      fi
     fi
   fi
 
