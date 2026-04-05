@@ -34,7 +34,7 @@ error() {
 }
 
 prompt() {
-  printf '%b' "${BLUE}$1${NC}"
+  echo -n -e "${BLUE}$1${NC}"
 }
 
 require_root() {
