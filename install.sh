@@ -1,83 +1,47 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
-WHIPTAIL_TITLE="Zanjir Installer"
 DOCKER_MIRRORS=(
   "https://docker.arvancloud.ir"
   "https://registry.docker.ir"
 )
 
-cleanup() {
-  rm -f /tmp/zanjir-whiptail-* 2>/dev/null || true
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info() {
+  printf '%b\n' "${YELLOW}[INFO]${NC} $1"
 }
 
-show_error() {
-  local message="$1"
-  if command -v whiptail >/dev/null 2>&1; then
-    whiptail --title "${WHIPTAIL_TITLE}" --msgbox "${message}" 12 72
-  else
-    printf 'ERROR: %s\n' "${message}" >&2
-  fi
+success() {
+  printf '%b\n' "${GREEN}[OK]${NC} $1"
 }
 
-handle_error() {
-  local exit_code="$1"
-  local line_no="$2"
-  trap - ERR
-  cleanup
-  show_error "Installation failed at line ${line_no} with exit code ${exit_code}."
-  exit "${exit_code}"
+warn() {
+  printf '%b\n' "${YELLOW}[WARN]${NC} $1"
 }
 
-trap 'handle_error $? $LINENO' ERR
-trap cleanup EXIT
+error() {
+  printf '%b\n' "${RED}[ERROR]${NC} $1" >&2
+}
+
+prompt() {
+  printf '%b' "${BLUE}$1${NC}"
+}
 
 require_root() {
   if [ "${EUID}" -ne 0 ]; then
-    show_error "Please run this installer as root or with sudo."
+    error "Please run this installer as root or with sudo."
     exit 1
   fi
-}
-
-bootstrap_whiptail() {
-  if command -v whiptail >/dev/null 2>&1; then
-    return 0
-  fi
-
-  export DEBIAN_FRONTEND=noninteractive
-  configure_apt_for_iran
-  apt-get update >/dev/null
-  apt-get install -y whiptail >/dev/null
-}
-
-msgbox() {
-  whiptail --title "${WHIPTAIL_TITLE}" --msgbox "$1" 14 78
-}
-
-infobox() {
-  whiptail --title "${WHIPTAIL_TITLE}" --infobox "$1" 10 78
-}
-
-yesno() {
-  whiptail --title "${WHIPTAIL_TITLE}" --yesno "$1" 12 78
-}
-
-inputbox() {
-  local prompt="$1"
-  local default_value="${2:-}"
-  local output_file
-  output_file="$(mktemp /tmp/zanjir-whiptail-input.XXXXXX)"
-
-  if ! whiptail --title "${WHIPTAIL_TITLE}" --inputbox "${prompt}" 12 78 "${default_value}" 2>"${output_file}"; then
-    rm -f "${output_file}"
-    return 1
-  fi
-
-  cat "${output_file}"
-  rm -f "${output_file}"
 }
 
 is_ip_address() {
@@ -188,27 +152,29 @@ run_compose() {
   elif docker-compose version >/dev/null 2>&1; then
     docker-compose "$@"
   else
-    show_error "Docker Compose is not available on this server."
+    error "Docker Compose is not available on this server."
     exit 1
   fi
 }
 
 install_docker_stack() {
-  infobox "Checking Docker prerequisites and applying Iran-friendly mirrors..."
+  info "Checking Docker prerequisites and applying Iran-friendly mirrors..."
   configure_apt_for_iran
   configure_docker_mirrors
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update >/dev/null
+  apt-get update
 
   if ! command -v docker >/dev/null 2>&1; then
-    apt-get install -y ca-certificates curl docker.io >/dev/null
+    info "Installing Docker..."
+    apt-get install -y ca-certificates curl docker.io
   fi
 
   if ! docker compose version >/dev/null 2>&1; then
+    info "Installing Docker Compose..."
     if ! apt-get install -y docker-compose-plugin >/dev/null 2>&1; then
       if ! apt-get install -y docker-compose-v2 >/dev/null 2>&1; then
-        apt-get install -y docker-compose >/dev/null
+        apt-get install -y docker-compose
       fi
     fi
   fi
@@ -222,27 +188,34 @@ install_docker_stack() {
   configure_docker_mirrors
 
   if ! docker_ready; then
-    show_error "Docker could not be started on this server. Please verify the Docker service and try again."
+    error "Docker could not be started on this server. Please verify the Docker service and try again."
     exit 1
   fi
 
   if ! compose_ready; then
-    show_error "Docker Compose could not be installed automatically."
+    error "Docker Compose could not be installed automatically."
     exit 1
   fi
+
+  success "Docker and Docker Compose are ready."
 }
 
 ensure_docker_stack() {
-  infobox "Checking Docker and Docker Compose..."
+  info "Checking Docker and Docker Compose..."
 
   if docker_ready && compose_ready; then
+    success "Docker and Docker Compose are already available."
     return 0
   fi
 
-  if yesno "Docker or Docker Compose is missing. The installer can configure Iranian mirrors and try to install them now. Continue?"; then
+  prompt "Docker or Docker Compose is missing. Configure Iranian mirrors and install them now? [Y/n]: "
+  read -r install_choice
+  install_choice="${install_choice:-Y}"
+
+  if [[ "${install_choice}" =~ ^[Yy]$ ]]; then
     install_docker_stack
   else
-    show_error "Installation cancelled because Docker is required."
+    error "Installation cancelled because Docker is required."
     exit 1
   fi
 }
@@ -250,7 +223,7 @@ ensure_docker_stack() {
 load_offline_images() {
   local images_dir="${SCRIPT_DIR}/images"
   if [ ! -d "${images_dir}" ]; then
-    msgbox "No offline image bundle was detected in ${images_dir}. The installer will continue with local or online Docker sources."
+    warn "No offline image bundle was detected in ${images_dir}. Continuing without image preloading."
     return 0
   fi
 
@@ -259,81 +232,77 @@ load_offline_images() {
   shopt -u nullglob
 
   if [ "${#image_files[@]}" -eq 0 ]; then
-    msgbox "The images directory exists, but no .tar files were found. The installer will continue without offline image loading."
+    warn "The images directory exists, but no .tar files were found. Continuing without image preloading."
     return 0
   fi
 
-  local total="${#image_files[@]}"
-  {
-    local index=0
-    local tar_file
-    for tar_file in "${image_files[@]}"; do
-      local percent=$(( index * 100 / total ))
-      echo "${percent}"
-      echo "XXX"
-      echo "Loading offline image $(basename "${tar_file}")..."
-      echo "XXX"
-      docker load -i "${tar_file}" >/dev/null
-      index=$(( index + 1 ))
-    done
-    echo "100"
-    echo "XXX"
-    echo "Offline Docker images loaded successfully."
-    echo "XXX"
-  } | whiptail --title "${WHIPTAIL_TITLE}" --gauge "Loading offline Docker images..." 10 78 0
+  info "Loading offline Docker images..."
+  local tar_file
+  for tar_file in "${image_files[@]}"; do
+    info "Loading $(basename "${tar_file}")"
+    docker load -i "${tar_file}"
+  done
+  success "Offline Docker images loaded successfully."
 }
 
-prompt_required_input() {
-  local prompt="$1"
+prompt_required_value() {
+  local message="$1"
   local default_value="${2:-}"
-  local result=""
+  local value=""
 
   while :; do
-    if ! result="$(inputbox "${prompt}" "${default_value}")"; then
-      show_error "Installation cancelled."
-      exit 1
+    if [ -n "${default_value}" ]; then
+      prompt "${message} [${default_value}]: "
+    else
+      prompt "${message}: "
     fi
+    read -r value
+    value="${value:-${default_value}}"
 
-    if [ -n "${result}" ]; then
-      printf '%s' "${result}"
+    if [ -n "${value}" ]; then
+      printf '%s' "${value}"
       return 0
     fi
 
-    msgbox "This field cannot be empty."
+    warn "This field cannot be empty."
   done
 }
 
 prompt_configuration() {
-  local saved_address
+  local saved_address saved_http_port saved_https_port saved_email
+
   saved_address="$(read_env_value "SERVER_ADDRESS" "$(read_env_value "DOMAIN" "")")"
-  SERVER_ADDRESS="$(prompt_required_input "Enter the public domain name or IP address for this Zanjir server." "${saved_address}")"
+  SERVER_ADDRESS="$(prompt_required_value "Enter the public domain name or IP address for this Zanjir server" "${saved_address}")"
 
-  local saved_port
-  saved_port="$(read_env_value "HTTPS_PORT" "443")"
-  HTTPS_PORT="$(prompt_required_input "Enter the HTTPS port for Zanjir." "${saved_port}")"
+  saved_http_port="$(read_env_value "HTTP_PORT" "80")"
+  HTTP_PORT="$(prompt_required_value "Enter the HTTP port for Zanjir" "${saved_http_port}")"
+  if ! [[ "${HTTP_PORT}" =~ ^[0-9]+$ ]] || [ "${HTTP_PORT}" -lt 1 ] || [ "${HTTP_PORT}" -gt 65535 ]; then
+    error "HTTP port must be a number between 1 and 65535."
+    exit 1
+  fi
+
+  saved_https_port="$(read_env_value "HTTPS_PORT" "443")"
+  HTTPS_PORT="$(prompt_required_value "Enter the HTTPS port for Zanjir" "${saved_https_port}")"
   if ! [[ "${HTTPS_PORT}" =~ ^[0-9]+$ ]] || [ "${HTTPS_PORT}" -lt 1 ] || [ "${HTTPS_PORT}" -gt 65535 ]; then
-    show_error "HTTPS port must be a number between 1 and 65535."
+    error "HTTPS port must be a number between 1 and 65535."
     exit 1
   fi
 
-  local email_default
   if is_ip_address "${SERVER_ADDRESS}"; then
-    email_default="$(read_env_value "LETSENCRYPT_EMAIL" "")"
+    saved_email="$(read_env_value "LETSENCRYPT_EMAIL" "")"
   else
-    email_default="$(read_env_value "LETSENCRYPT_EMAIL" "admin@${SERVER_ADDRESS}")"
+    saved_email="$(read_env_value "LETSENCRYPT_EMAIL" "admin@${SERVER_ADDRESS}")"
   fi
 
-  if ! ADMIN_EMAIL="$(inputbox "Enter the admin email address used for TLS notifications. Leave blank if you are installing by IP only." "${email_default}")"; then
-    show_error "Installation cancelled."
-    exit 1
-  fi
+  prompt "Enter the admin email address used for TLS notifications [${saved_email}]: "
+  read -r ADMIN_EMAIL
+  ADMIN_EMAIL="${ADMIN_EMAIL:-${saved_email}}"
 
   DOMAIN="${SERVER_ADDRESS}"
-  HTTP_PORT="80"
   PROTOCOL="https"
   if is_ip_address "${SERVER_ADDRESS}"; then
     IP_MODE="true"
-    [ -n "${ADMIN_EMAIL}" ] || ADMIN_EMAIL=""
+    ADMIN_EMAIL="${ADMIN_EMAIL:-}"
   else
     IP_MODE="false"
     if [ -z "${ADMIN_EMAIL}" ]; then
@@ -341,8 +310,20 @@ prompt_configuration() {
     fi
   fi
 
-  if ! yesno "Please confirm the configuration:\n\nAddress: ${SERVER_ADDRESS}\nHTTPS Port: ${HTTPS_PORT}\nAdmin Email: ${ADMIN_EMAIL:-none}\nOffline Images: $( [ -d "${SCRIPT_DIR}/images" ] && printf 'yes' || printf 'no' )"; then
-    show_error "Installation cancelled."
+  printf '\n'
+  info "Installation settings:"
+  printf '  Address: %s\n' "${SERVER_ADDRESS}"
+  printf '  HTTP Port: %s\n' "${HTTP_PORT}"
+  printf '  HTTPS Port: %s\n' "${HTTPS_PORT}"
+  printf '  Admin Email: %s\n' "${ADMIN_EMAIL:-none}"
+  printf '  Offline Images: %s\n' "$( [ -d "${SCRIPT_DIR}/images" ] && printf 'yes' || printf 'no' )"
+  printf '\n'
+
+  prompt "Continue with these settings? [Y/n]: "
+  read -r confirm_choice
+  confirm_choice="${confirm_choice:-Y}"
+  if ! [[ "${confirm_choice}" =~ ^[Yy]$ ]]; then
+    error "Installation cancelled."
     exit 1
   fi
 }
@@ -354,6 +335,7 @@ write_env_file() {
   local coturn_image
   local element_image
   local caddy_image
+
   registration_secret="$(read_env_value "REGISTRATION_SHARED_SECRET" "")"
   turn_secret="$(read_env_value "TURN_SECRET" "")"
   conduit_image="$(read_env_value "CONDUIT_IMAGE" "docker.io/matrixconduit/matrix-conduit:latest")"
@@ -385,11 +367,12 @@ CADDY_IMAGE=${caddy_image}
 EOF
 
   chmod 600 "${ENV_FILE}"
+  success "Wrote ${ENV_FILE}."
 }
 
 configure_caddy() {
   if [ ! -f "${SCRIPT_DIR}/Caddyfile" ]; then
-    show_error "Caddyfile was not found in ${SCRIPT_DIR}."
+    error "Caddyfile was not found in ${SCRIPT_DIR}."
     exit 1
   fi
 }
@@ -400,22 +383,27 @@ configure_element() {
     -e "s#\"server_name\": \"[^\"]*\"#\"server_name\": \"${SERVER_ADDRESS}\"#g" \
     -e "s#\"permalink_prefix\": \"[^\"]*\"#\"permalink_prefix\": \"https://${SERVER_ADDRESS}\"#g" \
     "${SCRIPT_DIR}/config/element-config.json"
+  success "Updated Element configuration."
 }
 
 start_services() {
-  infobox "Preparing Zanjir service configuration..."
+  info "Preparing Zanjir service configuration..."
   write_env_file
   configure_caddy
   configure_element
 
-  infobox "Building local images and starting services..."
-  run_compose build admin >/dev/null
-  run_compose up -d >/dev/null
+  info "Building local admin image..."
+  run_compose build admin
+
+  info "Starting services..."
+  run_compose up -d
+  success "Services started."
 }
 
 install_cli_tool() {
   cp "${SCRIPT_DIR}/zanjir-cli.sh" /usr/local/bin/zanjir
   chmod +x /usr/local/bin/zanjir
+  success "Installed zanjir CLI to /usr/local/bin/zanjir."
 }
 
 show_success() {
@@ -425,14 +413,25 @@ show_success() {
   fi
 
   local admin_url="${base_url}/admin/"
-  msgbox "Zanjir installation completed successfully.\n\nMain URL: ${base_url}\nAdmin Panel: ${admin_url}\nRegistration Secret: $(read_env_value "REGISTRATION_SHARED_SECRET")\n\nYou can now type 'zanjir' or 'zanjir doctor' from anywhere in your terminal to manage and diagnose the server.\n\nIf you are using an IP address, your browser will likely warn about a self-signed certificate the first time you connect."
+
+  printf '\n%b\n' "${GREEN}Zanjir installation completed successfully.${NC}"
+  printf '%b\n' "${GREEN}----------------------------------------${NC}"
+  printf 'Main URL: %s\n' "${base_url}"
+  printf 'Admin Panel: %s\n' "${admin_url}"
+  printf 'Registration Secret: %s\n' "$(read_env_value "REGISTRATION_SHARED_SECRET")"
+  printf '\n'
+  printf '%b\n' "${CYAN}You can now type 'zanjir' or 'zanjir doctor' from anywhere in your terminal.${NC}"
+  if [ "${IP_MODE}" = "true" ]; then
+    printf '%b\n' "${YELLOW}Because you are using an IP address, your browser may warn about the self-signed certificate on first access.${NC}"
+  fi
 }
 
 main() {
-  require_root
-  bootstrap_whiptail
+  printf '\n%b\n' "${CYAN}========================================${NC}"
+  printf '%b\n' "${CYAN}      Zanjir Air-Gapped Installer       ${NC}"
+  printf '%b\n\n' "${CYAN}========================================${NC}"
 
-  msgbox "Welcome to the Zanjir air-gapped installer.\n\nThis wizard will check Docker, optionally configure Iranian mirrors, load offline Docker images if available, collect your deployment settings, and start the stack."
+  require_root
   ensure_docker_stack
   load_offline_images
   prompt_configuration
