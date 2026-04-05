@@ -413,6 +413,11 @@ start_services() {
   run_compose up -d >/dev/null
 }
 
+install_cli_tool() {
+  cp "${SCRIPT_DIR}/zanjir-cli.sh" /usr/local/bin/zanjir
+  chmod +x /usr/local/bin/zanjir
+}
+
 show_success() {
   local base_url="${PROTOCOL}://${SERVER_ADDRESS}"
   if [ "${HTTPS_PORT}" != "443" ]; then
@@ -420,7 +425,7 @@ show_success() {
   fi
 
   local admin_url="${base_url}/admin/"
-  msgbox "Zanjir installation completed successfully.\n\nMain URL: ${base_url}\nAdmin Panel: ${admin_url}\nRegistration Secret: $(read_env_value "REGISTRATION_SHARED_SECRET")\n\nIf you are using an IP address, your browser will likely warn about a self-signed certificate the first time you connect."
+  msgbox "Zanjir installation completed successfully.\n\nMain URL: ${base_url}\nAdmin Panel: ${admin_url}\nRegistration Secret: $(read_env_value "REGISTRATION_SHARED_SECRET")\n\nYou can now type 'zanjir' or 'zanjir doctor' from anywhere in your terminal to manage and diagnose the server.\n\nIf you are using an IP address, your browser will likely warn about a self-signed certificate the first time you connect."
 }
 
 main() {
@@ -432,6 +437,7 @@ main() {
   load_offline_images
   prompt_configuration
   start_services
+  install_cli_tool
   show_success
 }
 
