@@ -18,15 +18,15 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 info() {
-  printf '%b\n' "${YELLOW}[INFO]${NC} $1"
+  printf '%b\n' "${YELLOW}[INFO]${NC} $1" >&2
 }
 
 success() {
-  printf '%b\n' "${GREEN}[OK]${NC} $1"
+  printf '%b\n' "${GREEN}[OK]${NC} $1" >&2
 }
 
 warn() {
-  printf '%b\n' "${YELLOW}[WARN]${NC} $1"
+  printf '%b\n' "${YELLOW}[WARN]${NC} $1" >&2
 }
 
 error() {
@@ -34,7 +34,7 @@ error() {
 }
 
 prompt() {
-  echo -n -e "${BLUE}$1${NC}"
+  echo -n -e "${BLUE}$1${NC}" >&2
 }
 
 require_root() {
