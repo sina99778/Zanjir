@@ -32,6 +32,8 @@
         reverse_proxy admin:5000
     }
 
+    redir /app* /
+
     handle {
         reverse_proxy element-web:80
     }
