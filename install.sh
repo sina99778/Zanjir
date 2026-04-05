@@ -353,14 +353,12 @@ write_env_file() {
   local conduit_image
   local coturn_image
   local element_image
-  local element_copy_image
   local caddy_image
   registration_secret="$(read_env_value "REGISTRATION_SHARED_SECRET" "")"
   turn_secret="$(read_env_value "TURN_SECRET" "")"
   conduit_image="$(read_env_value "CONDUIT_IMAGE" "docker.io/matrixconduit/matrix-conduit:latest")"
   coturn_image="$(read_env_value "COTURN_IMAGE" "coturn/coturn:latest")"
   element_image="$(read_env_value "ELEMENT_IMAGE" "vectorim/element-web:v1.11.50")"
-  element_copy_image="$(read_env_value "ELEMENT_COPY_IMAGE" "vectorim/element-web:v1.11.50")"
   caddy_image="$(read_env_value "CADDY_IMAGE" "caddy:2-alpine")"
 
   if [ -z "${registration_secret}" ]; then
@@ -383,7 +381,6 @@ LETSENCRYPT_EMAIL=${ADMIN_EMAIL}
 CONDUIT_IMAGE=${conduit_image}
 COTURN_IMAGE=${coturn_image}
 ELEMENT_IMAGE=${element_image}
-ELEMENT_COPY_IMAGE=${element_copy_image}
 CADDY_IMAGE=${caddy_image}
 EOF
 
@@ -391,10 +388,9 @@ EOF
 }
 
 configure_caddy() {
-  if [ "${IP_MODE}" = "true" ]; then
-    cp "${SCRIPT_DIR}/Caddyfile.ip-mode" "${SCRIPT_DIR}/Caddyfile.active"
-  else
-    cp "${SCRIPT_DIR}/Caddyfile" "${SCRIPT_DIR}/Caddyfile.active"
+  if [ ! -f "${SCRIPT_DIR}/Caddyfile" ]; then
+    show_error "Caddyfile was not found in ${SCRIPT_DIR}."
+    exit 1
   fi
 }
 
@@ -414,7 +410,6 @@ start_services() {
 
   infobox "Building local images and starting services..."
   run_compose build admin >/dev/null
-  run_compose run --rm element-copy >/dev/null
   run_compose up -d >/dev/null
 }
 

@@ -1,8 +1,7 @@
 # Zanjir - Docker Compose Configuration
-# Self-hosted Matrix server with Conduit, Element Web, and Caddy
+# Air-gapped friendly Matrix deployment with Caddy internal TLS
 
 services:
-  # Conduit Matrix Homeserver (Rust-based)
   conduit:
     image: ${CONDUIT_IMAGE:-docker.io/matrixconduit/matrix-conduit:latest}
     container_name: zanjir-conduit
@@ -26,7 +25,6 @@ services:
     networks:
       - zanjir-network
 
-  # Coturn TURN Server for Voice/Video Calls
   coturn:
     image: ${COTURN_IMAGE:-coturn/coturn:latest}
     container_name: zanjir-coturn
@@ -52,7 +50,6 @@ services:
     networks:
       - zanjir-network
 
-  # Admin Panel
   admin:
     build: ./admin
     container_name: zanjir-admin
@@ -69,18 +66,18 @@ services:
     depends_on:
       - conduit
 
-  # Element Web Client
-  element:
+  element-web:
     image: ${ELEMENT_IMAGE:-vectorim/element-web:v1.11.50}
-    container_name: zanjir-element
+    container_name: zanjir-element-web
     restart: unless-stopped
     volumes:
       - ./config/element-config.json:/app/config.json:ro
       - ./config/welcome.html:/app/welcome.html:ro
+      - ./config/logo.webp:/app/logo.webp:ro
+      - ./config/custom.css:/app/custom.css:ro
     networks:
       - zanjir-network
 
-  # Caddy Reverse Proxy with Automatic HTTPS
   caddy:
     image: ${CADDY_IMAGE:-caddy:2-alpine}
     container_name: zanjir-caddy
@@ -90,46 +87,18 @@ services:
       - "${HTTPS_PORT:-443}:443"
     environment:
       DOMAIN: ${DOMAIN}
-      SERVER_ADDRESS: ${SERVER_ADDRESS:-${DOMAIN}}
-      HTTPS_PORT: ${HTTPS_PORT:-443}
       HTTP_PORT: ${HTTP_PORT:-80}
+      HTTPS_PORT: ${HTTPS_PORT:-443}
     volumes:
-      - ./Caddyfile.active:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-      # Mount Element Web files for serving
-      - element-web:/srv/element:ro
     networks:
       - zanjir-network
     depends_on:
       - conduit
-      - element
-
-  # Utility container to copy Element Web files
-  element-copy:
-    image: ${ELEMENT_COPY_IMAGE:-vectorim/element-web:v1.11.50}
-    container_name: zanjir-element-copy
-    user: root
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        cp -r /app/* /srv/element/
-        cp /config/config.json /srv/element/config.json
-        cp /config/welcome.html /srv/element/welcome.html
-        cp /config/logo.webp /srv/element/logo.webp
-        cp /config/custom.css /srv/element/custom.css
-        mkdir -p /srv/element/mobile_guide
-        cp /config/mobile_guide.html /srv/element/mobile_guide/index.html
-        echo "Element Web files copied successfully"
-    volumes:
-      - element-web:/srv/element
-      - ./config/element-config.json:/config/config.json:ro
-      - ./config/welcome.html:/config/welcome.html:ro
-      - ./config/logo.webp:/config/logo.webp:ro
-      - ./config/custom.css:/config/custom.css:ro
-      - ./config/mobile_guide.html:/config/mobile_guide.html:ro
-    networks:
-      - zanjir-network
+      - admin
+      - element-web
 
 networks:
   zanjir-network:
@@ -142,7 +111,5 @@ volumes:
     name: zanjir-caddy-data
   caddy-config:
     name: zanjir-caddy-config
-  element-web:
-    name: zanjir-element-web
   admin-data:
     name: zanjir-admin-data

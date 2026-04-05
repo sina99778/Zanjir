@@ -1,85 +1,48 @@
-# Zanjir - Caddy Reverse Proxy Configuration (Domain Mode)
-# Automatic HTTPS with Let's Encrypt
+# Zanjir - Air-gapped Caddy reverse proxy
 
-:{$HTTPS_PORT:-443} {
-    # Encode responses
+{$DOMAIN}:{$HTTPS_PORT} {
+    tls internal
     encode gzip zstd
 
-    # Matrix .well-known endpoints
     handle /.well-known/matrix/server {
         header Content-Type application/json
-        respond `{"m.server": "{$DOMAIN}:{$HTTPS_PORT:-443}"}`
+        respond `{"m.server":"{$DOMAIN}:{$HTTPS_PORT}"}`
     }
 
     handle /.well-known/matrix/client {
         header Content-Type application/json
         header Access-Control-Allow-Origin *
-        respond `{"m.homeserver": {"base_url": "https://{$DOMAIN}"}, "m.identity_server": {"base_url": "https://vector.im"}}`
+        respond `{"m.homeserver":{"base_url":"https://{$DOMAIN}:{$HTTPS_PORT}"}}`
     }
 
-    # Matrix Client-Server API
     handle /_matrix/* {
         reverse_proxy conduit:6167
     }
 
-    # Matrix Federation API
-    handle /_dendrite/* {
+    handle /_synapse/client/* {
         reverse_proxy conduit:6167
     }
 
-    # Admin Panel
     handle /admin/* {
         reverse_proxy admin:5000
     }
 
-    # Mobile guide - serve our custom page directly
-    handle /mobile_guide* {
-        root * /srv/element/mobile_guide
-        rewrite * /index.html
-        file_server
-    }
-
-    # Welcome page - serve our custom page directly (bypasses Element's wrapper)
-    @welcome {
-        path / /welcome /welcome.html
-    }
-    handle @welcome {
-        root * /srv/element
-        rewrite * /welcome.html
-        file_server
-    }
-
-    # Element App - serve at /app/ path
-    handle /app/* {
-        uri strip_prefix /app
-        root * /srv/element
-        file_server
-        try_files {path} /index.html
-    }
-
-    # Element Web (default for other paths)
     handle {
-        root * /srv/element
-        file_server
-        try_files {path} /index.html
+        reverse_proxy element-web:80
     }
 
-    # Security headers
     header {
         X-Frame-Options SAMEORIGIN
         X-Content-Type-Options nosniff
-        X-XSS-Protection "1; mode=block"
         Referrer-Policy strict-origin-when-cross-origin
     }
 
-    # Logging
     log {
         output stdout
         format console
     }
 }
 
-# Redirect HTTP to HTTPS
-:{$HTTP_PORT:-80} {
-    redir https://{host}:{$HTTPS_PORT:-443}{uri} permanent
+:{$HTTP_PORT} {
+    redir https://{$DOMAIN}:{$HTTPS_PORT}{uri} permanent
 }
