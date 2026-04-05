@@ -1,0 +1,27 @@
+name: Release Offline Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make pack.sh executable
+        run: chmod +x pack.sh
+
+      - name: Build offline bundle
+        run: bash pack.sh
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: zanjir-offline.tar.gz
