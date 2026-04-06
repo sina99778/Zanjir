@@ -11,10 +11,12 @@ from datetime import datetime
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv('../.env')
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 app.secret_key = os.getenv('REGISTRATION_SHARED_SECRET', 'change-me-in-production')
 
 # Configuration

@@ -340,7 +340,7 @@ write_env_file() {
   turn_secret="$(read_env_value "TURN_SECRET" "")"
   conduit_image="$(read_env_value "CONDUIT_IMAGE" "docker.io/matrixconduit/matrix-conduit:latest")"
   coturn_image="$(read_env_value "COTURN_IMAGE" "coturn/coturn:latest")"
-  element_image="$(read_env_value "ELEMENT_IMAGE" "vectorim/element-web:v1.11.50")"
+  element_image="$(read_env_value "ELEMENT_IMAGE" "ghcr.io/schildichat/schildichat-web:latest")"
   caddy_image="$(read_env_value "CADDY_IMAGE" "caddy:2-alpine")"
 
   if [ -z "${registration_secret}" ]; then

@@ -29,7 +29,9 @@
     }
 
     handle_path /admin* {
-        reverse_proxy admin:5000
+        reverse_proxy admin:5000 {
+            header_up X-Forwarded-Prefix /admin
+        }
     }
 
     redir /app* /

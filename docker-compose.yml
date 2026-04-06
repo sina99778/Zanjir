@@ -67,7 +67,7 @@ services:
       - conduit
 
   element-web:
-    image: ${ELEMENT_IMAGE:-vectorim/element-web:v1.11.50}
+    image: ${ELEMENT_IMAGE:-ghcr.io/schildichat/schildichat-web:latest}
     container_name: zanjir-element-web
     restart: unless-stopped
     volumes:
